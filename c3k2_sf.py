@@ -1,218 +1,201 @@
-"""Local PyTorch implementations for manuscript Fig. 2 and Eqs. (1)-(13).
+"""Figure 2 and Eqs. (1)-(13), with explicitly declared missing settings.
 
-Contains C3k2_SF, its inner C3k_SF, AKConv and normalized DCT-II FCA.
-No Ultralytics/torchvision/einops dependency. Python >= 3.8.
-See README.md for interpretation choices and upstream sources.
-Sources: github.com/CV-ZhangXin/LDConv/model.py and
-github.com/cfzd/FcaNet/model/layer.py; source attribution/versions in README.
+AKConv: offset -> bilinear resampling -> reshape -> convolution -> DSC -> SiLU.
+FCA: normalized DCT-II responses -> C-vector -> MLP -> channel reweighting.
+C3k_SF: Bottleneck branch || AKConv/FCA branch, then concatenate/project.
+C3k2_SF: outer C2f-style multi-output concatenation shown in Fig. 2.
+
+Reference concepts: CV-ZhangXin/LDConv and cfzd/FcaNet. This is a local
+reference implementation, not evidence of the original experimental settings.
 """
 import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from .common import Conv, Bottleneck
 
-PAPER_FREQUENCIES = ((0, 0), (0, 1), (1, 0), (2, 2),
-                     (3, 3), (6, 0), (0, 6), (6, 6))
-
-
-class Conv(nn.Module):
-    """Local Conv2d -> BN2d -> SiLU."""
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1):
-        super().__init__()
-        self.conv = nn.Conv2d(c1, c2, k, s, k // 2 if p is None else p,
-                              groups=g, bias=False)
-        self.bn, self.act = nn.BatchNorm2d(c2), nn.SiLU()
-
-    def forward(self, x):
-        return self.act(self.bn(self.conv(x)))
-
-
-class Bottleneck(nn.Module):
-    def __init__(self, c1, c2, shortcut=True, e=1.0):
-        super().__init__()
-        hidden = max(1, int(c2 * e))
-        self.cv1, self.cv2 = Conv(c1, hidden, 3), Conv(hidden, c2, 3)
-        self.add = shortcut and c1 == c2
-
-    def forward(self, x):
-        y = self.cv2(self.cv1(x))
-        return x + y if self.add else y
+FREQUENCIES = {
+    "F1": ((0, 0), (0, 1), (1, 0)),
+    "F2": ((0, 0), (0, 1), (1, 0), (2, 2), (3, 3)),
+    "F3": ((0, 0), (0, 1), (1, 0), (2, 2), (3, 3), (6, 0), (0, 6), (6, 6)),
+}
 
 
 class AKConv(nn.Module):
-    """Arbitrary-N adaptive kernel convolution with explicit bilinear sampling.
+    """N-point adaptive sampling; N=5 follows the C x 5H x W in Fig. 2.
 
-    N=5 follows the C,5H,W tensor in Fig. 2. The initial lattice follows the
-    near-square non-centred layout in the authors' LDConv/AKConv repository.
-    Offset order is N row offsets then N column offsets. The sampled tensor
-    is rearranged to B,C,H*N,W and fused using an (N,1) convolution + BN/SiLU.
+    Coordinates are N row offsets followed by N column offsets. Initial
+    points form a non-centred near-square lattice, as in LDConv. Border
+    replication is an implementation assumption, absent from the manuscript.
+    DSC is depthwise 3x3 + pointwise 1x1, with ONE final BN/SiLU. No optional
+    hidden extra layers are added for matching the manuscript's cost figures.
     """
-    def __init__(self, c1, c2, num_param=5, stride=1, bias=False):
+    def __init__(self, c1, c2, num_points=5, stride=1, learn_offsets=True):
         super().__init__()
-        if not isinstance(num_param, int) or num_param < 1:
-            raise ValueError("num_param must be a positive integer")
-        if not isinstance(stride, int) or stride < 1:
-            raise ValueError("stride must be a positive integer")
-        self.num_param, self.stride = num_param, stride
-        self.p_conv = nn.Conv2d(c1, 2 * num_param, 3, stride, 1)
-        nn.init.zeros_(self.p_conv.weight)
-        nn.init.zeros_(self.p_conv.bias)
-        width = max(1, round(math.sqrt(num_param)))
-        points = [(i // width, i % width) for i in range(num_param)]
-        self.register_buffer("initial_points", torch.tensor(points, dtype=torch.float32))
-        self.conv = nn.Sequential(
-            nn.Conv2d(c1, c2, (num_param, 1), (num_param, 1), bias=bias),
-            nn.BatchNorm2d(c2), nn.SiLU())
+        if min(c1, c2, num_points, stride) < 1:
+            raise ValueError("Channels, sampling points and stride must be positive")
+        self.c1, self.c2 = c1, c2
+        self.num_points, self.stride = num_points, stride
+        self.learn_offsets = learn_offsets
+        if learn_offsets:
+            self.offset = nn.Conv2d(c1, 2 * num_points, 3, stride, 1)
+            nn.init.zeros_(self.offset.weight)
+            nn.init.zeros_(self.offset.bias)
+        else:
+            self.offset = None  # Fixed-sampling control has no unused predictor.
+        width = max(1, round(math.sqrt(num_points)))
+        self.register_buffer("initial_points", torch.tensor(
+            [(i // width, i % width) for i in range(num_points)], dtype=torch.float32))
+        self.aggregate = nn.Conv2d(c1, c2, (num_points, 1), (num_points, 1), bias=False)
+        self.depthwise = nn.Conv2d(c2, c2, 3, padding=1, groups=c2, bias=False)
+        self.pointwise = nn.Conv2d(c2, c2, 1, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = nn.SiLU()
 
-    def sampling_coordinates(self, x):
-        """Pixel row/column coordinates, each B,N,Hout,Wout."""
-        offset = self.p_conv(x)
-        ho, wo = offset.shape[-2:]
+    def coordinates(self, x):
+        b, _, h, w = x.shape
         dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
-        offset = offset.to(dtype)
-        yy, xx = torch.meshgrid(
-            torch.arange(ho, device=x.device, dtype=dtype),
-            torch.arange(wo, device=x.device, dtype=dtype), indexing="ij")
+        if self.offset is None:
+            ho, wo = (h - 1) // self.stride + 1, (w - 1) // self.stride + 1
+            offsets = x.new_zeros((b, 2 * self.num_points, ho, wo), dtype=dtype)
+        else:
+            offsets = self.offset(x).to(dtype)
+            ho, wo = offsets.shape[-2:]
+        yy, xx = torch.meshgrid(torch.arange(ho, device=x.device, dtype=dtype),
+                                torch.arange(wo, device=x.device, dtype=dtype), indexing="ij")
         points = self.initial_points.to(dtype)
         rows = yy[None, None] * self.stride + points[:, 0][None, :, None, None]
         cols = xx[None, None] * self.stride + points[:, 1][None, :, None, None]
-        return rows + offset[:, :self.num_param], cols + offset[:, self.num_param:]
+        return rows + offsets[:, :self.num_points], cols + offsets[:, self.num_points:]
 
-    def sample(self, x, rows, cols):
-        """Bilinear interpolation with border clamping, Eq. (4)."""
+    def resample(self, x, rows, cols):
         b, c, h, w = x.shape
         ho, wo = rows.shape[-2:]
         rows, cols = rows.clamp(0, h - 1), cols.clamp(0, w - 1)
         gy = rows * (2.0 / (h - 1)) - 1 if h > 1 else rows * 0
         gx = cols * (2.0 / (w - 1)) - 1 if w > 1 else cols * 0
-        grid = torch.stack((gx, gy), dim=-1).permute(0, 2, 3, 1, 4)
-        grid = grid.reshape(b, ho, wo * self.num_param, 2)
-        # One grid_sample: avoids repeating the complete input N times.
+        grid = torch.stack((gx, gy), -1).permute(0, 2, 3, 1, 4)
+        grid = grid.reshape(b, ho, wo * self.num_points, 2)
         sampled = F.grid_sample(x.to(grid.dtype), grid, mode="bilinear",
                                 padding_mode="border", align_corners=True)
-        return sampled.to(x.dtype).reshape(b, c, ho, wo, self.num_param)
+        return sampled.to(x.dtype).reshape(b, c, ho, wo, self.num_points)
 
     def forward(self, x):
-        rows, cols = self.sampling_coordinates(x)
-        sampled = self.sample(x, rows, cols)
-        b, c, ho, wo, n = sampled.shape
-        sampled = sampled.permute(0, 1, 2, 4, 3).reshape(b, c, ho * n, wo)
-        return self.conv(sampled)
+        rows, cols = self.coordinates(x)
+        y = self.resample(x, rows, cols)
+        b, c, h, w, n = y.shape
+        y = y.permute(0, 1, 2, 4, 3).reshape(b, c, h * n, w)
+        y = self.aggregate(y)
+        return self.act(self.bn(self.pointwise(self.depthwise(y))))
 
 
 class FCA(nn.Module):
-    """Grouped normalized DCT-II attention, Eqs. (5)-(13).
+    """One frequency per channel group, with exactly C output descriptors.
 
-    One selected frequency per equal channel group; concatenation gives B,C,
-    as in Fig. 2. By default DCT is evaluated at the actual resolution.
-    Optional dct_size=(7,7) enables pooled FcaNet-style evaluation instead.
+    Balanced unequal group sizes support F1/F2 without changing channel widths.
+    With C % G != 0, the first C % G groups get one extra channel. This is a
+    declared completion of C_i in the manuscript, not a recovered ablation log.
+    DCT uses the ACTUAL H,W, with no adaptive pooling or frequency rescaling.
     """
-    def __init__(self, channels, reduction=16,
-                 frequencies=PAPER_FREQUENCIES, dct_size=None):
+    def __init__(self, channels, reduction=16, frequencies="F3", group_sizes=None):
         super().__init__()
-        self.channels, self.frequencies = channels, tuple(frequencies)
-        if not self.frequencies or channels % len(self.frequencies):
-            raise ValueError("FCA channels must be divisible by frequency count (default 8)")
-        if reduction < 1:
-            raise ValueError("reduction must be positive")
-        self.dct_size = tuple(dct_size) if dct_size is not None else None
+        if isinstance(frequencies, str):
+            frequencies = FREQUENCIES[frequencies]
+        self.frequencies = tuple(tuple(pair) for pair in frequencies)
+        if not self.frequencies or channels < len(self.frequencies):
+            raise ValueError("At least one channel is required for every frequency")
+        if reduction < 1 or channels % reduction:
+            raise ValueError("C/reduction must be a positive integer, as in Eq. (13)")
+        if any(len(pair) != 2 or any(not isinstance(v, int) or v < 0 for v in pair)
+               for pair in self.frequencies):
+            raise ValueError("DCT indices must be nonnegative integer pairs")
+        g = len(self.frequencies)
+        q, r = divmod(channels, g)
+        self.group_sizes = tuple(group_sizes) if group_sizes is not None else tuple(
+            q + int(i < r) for i in range(g))
+        if (len(self.group_sizes) != g or sum(self.group_sizes) != channels or
+                any(not isinstance(c, int) or c < 1 for c in self.group_sizes)):
+            raise ValueError("Positive integer group sizes must sum to C")
+        self.channels, self.reduction = channels, reduction
+        self.fc1 = nn.Linear(channels, channels // reduction, bias=False)
+        self.fc2 = nn.Linear(channels // reduction, channels, bias=False)
         self.register_buffer("_basis", torch.empty(0), persistent=False)
-        hidden = max(1, channels // reduction)
-        self.fc = nn.Sequential(nn.Linear(channels, hidden, bias=False),
-                                nn.ReLU(), nn.Linear(hidden, channels, bias=False),
-                                nn.Sigmoid())
 
     def dct_basis(self, h, w, device, dtype):
-        if any(u < 0 or v < 0 or u >= h or v >= w for u, v in self.frequencies):
-            raise ValueError("Selected DCT frequencies require sufficient size (default H,W >= 7)")
-        if (self._basis.shape != (self.channels, h, w) or
+        if any(u >= h or v >= w for u, v in self.frequencies):
+            raise ValueError("DCT indices exceed input size; F3 requires H,W >= 7")
+        if (tuple(self._basis.shape) != (self.channels, h, w) or
                 self._basis.device != device or self._basis.dtype != dtype):
-            xx = torch.arange(h, device=device, dtype=dtype) + 0.5
-            yy = torch.arange(w, device=device, dtype=dtype) + 0.5
-            filters = []
-            for u, v in self.frequencies:
-                au, av = math.sqrt((1 if u == 0 else 2) / h), math.sqrt((1 if v == 0 else 2) / w)
-                phi_u = au * torch.cos(math.pi * u * xx / h)
-                phi_v = av * torch.cos(math.pi * v * yy / w)
-                filters.append(phi_u[:, None] * phi_v[None, :])
-            self._basis = torch.stack(filters).repeat_interleave(
-                self.channels // len(self.frequencies), dim=0)
+            yy = torch.arange(h, device=device, dtype=dtype) + 0.5
+            xx = torch.arange(w, device=device, dtype=dtype) + 0.5
+            basis = []
+            for (u, v), count in zip(self.frequencies, self.group_sizes):
+                a = math.sqrt((1 if u == 0 else 2) / h)
+                b = math.sqrt((1 if v == 0 else 2) / w)
+                phi = a * torch.cos(math.pi * u * yy / h)
+                psi = b * torch.cos(math.pi * v * xx / w)
+                basis.append((phi[:, None] * psi[None, :])[None].expand(count, h, w))
+            self._basis = torch.cat(basis, 0)
         return self._basis
 
     def descriptor(self, x):
-        if x.shape[1] != self.channels:
-            raise ValueError("FCA input channel mismatch")
-        y = F.adaptive_avg_pool2d(x, self.dct_size) if self.dct_size else x
-        dtype = torch.float64 if y.dtype == torch.float64 else torch.float32
-        basis = self.dct_basis(*y.shape[-2:], y.device, dtype)
-        return (y.to(dtype) * basis[None]).sum(dim=(-2, -1)).to(x.dtype)
+        if x.ndim != 4 or x.shape[1] != self.channels:
+            raise ValueError("FCA expects NCHW with the configured C")
+        dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+        basis = self.dct_basis(*x.shape[-2:], x.device, dtype)
+        return (x.to(dtype) * basis[None]).sum((-2, -1)).to(x.dtype)
 
     def forward(self, x):
-        weights = self.fc(self.descriptor(x)).view(x.shape[0], self.channels, 1, 1)
-        return x * weights
-
-
-def _hidden(channels, expansion):
-    if expansion <= 0:
-        raise ValueError("expansion must be positive")
-    return max(8, int(math.ceil(channels * expansion / 8.0)) * 8)
+        z = self.descriptor(x)
+        weights = self.fc2(F.relu(self.fc1(z))).sigmoid()
+        return x * weights[:, :, None, None]
 
 
 class C3k_SF(nn.Module):
-    """Inner Fig. 2: Conv/Split -> Bottleneck || AKConv->FCA -> Cat/Conv."""
-    def __init__(self, c1, c2, n=2, shortcut=True, e=0.5,
-                 num_param=5, reduction=16, dct_size=None):
+    """Inner Fig. 2 unit. Eqs. (1)-(3) describe this unit's two branches."""
+    def __init__(self, c1, c2, n=2, shortcut=True, expansion=0.5,
+                 use_akconv=True, use_fca=True, frequencies="F3", reduction=16,
+                 num_points=5, learn_offsets=True):
         super().__init__()
-        if n < 1:
-            raise ValueError("n must be >= 1")
-        self.c = _hidden(c2, e)
-        self.cv1 = Conv(c1, 2 * self.c, 1)
-        self.bottlenecks = nn.Sequential(*[
-            Bottleneck(self.c, self.c, shortcut, e=1.0) for _ in range(n)])
-        self.akconv = AKConv(self.c, self.c, num_param)
-        self.fca = FCA(self.c, reduction, dct_size=dct_size)
-        self.cv2 = Conv(2 * self.c, c2, 1)
+        hidden = int(c2 * expansion)
+        if hidden < 1 or n < 1:
+            raise ValueError("Hidden channels and repeat count must be positive")
+        self.cv1 = Conv(c1, 2 * hidden, 1)
+        self.main = nn.Sequential(*[Bottleneck(hidden, shortcut) for _ in range(n)])
+        self.sampling = (AKConv(hidden, hidden, num_points, learn_offsets=learn_offsets)
+                         if use_akconv else Conv(hidden, hidden, 3))
+        self.frequency = (FCA(hidden, reduction, frequencies) if use_fca else nn.Identity())
+        self.cv2 = Conv(2 * hidden, c2, 1)
 
     def forward(self, x):
         fa, fb = self.cv1(x).chunk(2, 1)
-        f_ak = self.akconv(fb)                     # Eq. (1)
-        f_fca = self.fca(f_ak)                     # Eq. (2)
-        return self.cv2(torch.cat((self.bottlenecks(fa), f_fca), 1))  # Eq. (3)
+        fb = self.frequency(self.sampling(fb))
+        return self.cv2(torch.cat((self.main(fa), fb), 1))
 
 
 class C3k2_SF(nn.Module):
-    """Outer C3k2 multi-output concatenation, Fig. 2.
+    """Outer Conv/Split -> sequential C3k_SF -> multi-output Cat/Conv.
 
-    Both split tensors and every successive C3k_SF output enter the final
-    concatenation: (2+n)*hidden channels, not just two final branches.
+    Fourth argument is expansion, NOT the stock C3k2 c3k flag. Use keywords
+    or the supplied integration helper; do not drop into an unmodified parser.
+    No silent width rounding is performed.
     """
-    def __init__(self, c1, c2, n=1, shortcut=True, e=0.5, inner_n=2,
-                 inner_e=0.5, num_param=5, reduction=16, dct_size=None):
+    def __init__(self, c1, c2, n=1, expansion=0.25, inner_expansion=0.5,
+                 inner_depth=2, shortcut=True, use_akconv=True, use_fca=True,
+                 frequencies="F3", reduction=16, num_points=5, learn_offsets=True):
         super().__init__()
-        if n < 1:
-            raise ValueError("n must be >= 1")
-        self.c = _hidden(c2, e)
-        self.cv1 = Conv(c1, 2 * self.c, 1)
-        self.m = nn.ModuleList([
-            C3k_SF(self.c, self.c, inner_n, shortcut, inner_e,
-                   num_param, reduction, dct_size) for _ in range(n)])
-        self.cv2 = Conv((2 + n) * self.c, c2, 1)
+        self.hidden = int(c2 * expansion)
+        if self.hidden < 1 or n < 1:
+            raise ValueError("Hidden channels and repeat count must be positive")
+        self.cv1 = Conv(c1, 2 * self.hidden, 1)
+        self.blocks = nn.ModuleList([
+            C3k_SF(self.hidden, self.hidden, inner_depth, shortcut, inner_expansion,
+                   use_akconv, use_fca, frequencies, reduction, num_points, learn_offsets)
+            for _ in range(n)])
+        self.cv2 = Conv((2 + n) * self.hidden, c2, 1)
 
     def forward(self, x):
         parts = list(self.cv1(x).chunk(2, 1))
-        for block in self.m:
+        for block in self.blocks:
             parts.append(block(parts[-1]))
-        return self.cv2(torch.cat(parts, dim=1))
-
-
-C3k2SF = C3k2_SF
-C3K2_SF = C3k2_SF
-MultiSpectralFCA = FCA
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    m = C3k2_SF(64, 128)
-    x = torch.randn(2, 64, 24, 24, requires_grad=True)
-    y = m(x)
-    y.square().mean().backward()
-    print("C3k2_SF:", tuple(y.shape), "parameters:", sum(p.numel() for p in m.parameters()))
+        return self.cv2(torch.cat(parts, 1))
