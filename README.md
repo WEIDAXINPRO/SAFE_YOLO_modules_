@@ -24,4 +24,3 @@
 
 相关论文：FcaNet https://doi.org/10.1109/ICCV48922.2021.00082；LDConv https://doi.org/10.1016/j.imavis.2024.105190；EMA https://doi.org/10.1109/ICASSP49357.2023.10096516。RFAConv、ASFF论文信息可从各原作者仓库README追溯。
 
-已核查结构后本地重写、移除自定义外部层及einops。代码公开不等于没有许可约束；正式公开或商业使用前，请核查来源项目和Ultralytics适用许可、保留必要作者致谢。本文件夹不擅自授予上游代码新许可。
